@@ -1,0 +1,4 @@
+apiVersion: v2
+name: livecodebench-sandbox
+version: 1.0.0
+description: AnyEval LiveCodeBench sandbox with standard NetworkPolicy and no sidecars

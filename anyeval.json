@@ -1,0 +1,56 @@
+{
+  "anyeval_version": 1,
+  "eval": {
+    "id": "livecodebench",
+    "slug": "livecodebench",
+    "title": "LiveCodeBench: Original Code Generation (Jan–Apr 2025 window)",
+    "group": "Coding",
+    "tags": [
+      "coding",
+      "competitive-programming",
+      "python",
+      "sandbox",
+      "pass@1"
+    ],
+    "source": "upstream"
+  },
+  "upstream": {
+    "repo": "https://github.com/LiveCodeBench/LiveCodeBench",
+    "path": "lcb_runner",
+    "commit": "28fef95ea8c9f7a547c8329f2cd3d32b92c1fa24",
+    "inspect_ai": "0.3.260",
+    "eval_version": "1.0.0",
+    "dependency": ""
+  },
+  "execution": {
+    "class": "sandbox-k8s",
+    "cost_class": "medium",
+    "sandbox": "k8s",
+    "requires_internet": false,
+    "fast": false,
+    "supports_k8s": true,
+    "environment": "livecodebench/values.yaml"
+  },
+  "tasks": [
+    {
+      "name": "livecodebench",
+      "samples": 144
+    }
+  ],
+  "total_samples": 144,
+  "external_assets": [
+    {
+      "type": "container",
+      "source": "python:3.12-slim"
+    },
+    {
+      "type": "container",
+      "source": "coredns/coredns:1.8.3",
+      "condition": "Built-in k8s chart only; omitted by anyeval_chart=true"
+    }
+  ],
+  "scaffolds": [
+    "baseline"
+  ],
+  "generated": "2026-09-09"
+}

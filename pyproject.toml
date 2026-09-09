@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "eval-livecodebench"
+version = "1.0.0"
+description = "Original LiveCodeBench code generation, packaged offline for AnyEval and Inspect"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "Apache-2.0"}
+dependencies = []
+
+[project.optional-dependencies]
+# AnyEval requirements give ranges; these are its installed, resolved versions.
+inspect = ["inspect_ai==0.3.260"]
+anyeval = ["inspect_ai==0.3.260", "inspect-evals==0.18.0", "inspect-k8s-sandbox==0.13.0"]
+test = ["inspect_ai==0.3.260", "pytest>=8", "PyYAML>=6", "jsonschema>=4"]
+
+# Inspect discovers this import before resolving livecodebench/livecodebench.
+[project.entry-points.inspect_ai]
+livecodebench = "livecodebench"
+
+[tool.setuptools]
+packages = ["livecodebench"]
+include-package-data = true
+
+[tool.setuptools.package-data]
+livecodebench = ["data/*.gz", "data/*.json", "*.yaml", "chart/*.yaml", "chart/templates/*.yaml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--tb=short --basetemp=.build/pytest-tmp"

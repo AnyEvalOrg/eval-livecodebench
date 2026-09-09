@@ -1,0 +1,10 @@
+id: baseline
+version: 1
+description: Official LiveCodeBench generic code-generation prompt, one generation, all-tests pass@1.
+upstream_default: true
+budget:
+  max_turns: 1
+  max_tokens: null
+notes: >
+  No tools or test feedback are exposed to the model. The task uses one epoch.
+  Generation settings and any caller token limit must accompany reported results.

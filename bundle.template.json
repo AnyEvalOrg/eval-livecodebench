@@ -1,0 +1,20 @@
+{
+  "$schema": "https://anyeval.com/schema/bundle/1",
+  "bundle_version": 1,
+  "generated_at": null,
+  "eval": {"id": "livecodebench", "task": "livecodebench/livecodebench", "sample_id": null},
+  "upstream": {"repo": "https://github.com/LiveCodeBench/LiveCodeBench", "inspect_ai": "0.3.260"},
+  "dataset": {
+    "source": "livecodebench/code_generation_lite",
+    "revision": "0fe84c3912ea0c4d4a78037083943e8f0c4dd505",
+    "release": "release_v6",
+    "window": "2025-01-25/2025-04-06"
+  },
+  "model": {"name": null, "provider": null, "served": []},
+  "scaffold": {"id": "baseline", "version": 1, "token_limit": null},
+  "sandbox": {"class": null, "provenance": null},
+  "scorer": {"name": "livecodebench_scorer", "metric": "pass@1"},
+  "receipts": [],
+  "routing": [],
+  "outputs": {"status": null, "score": null, "explanation": null}
+}

@@ -1,0 +1,38 @@
+# AnyEval publication policy; the publisher must apply it before publishing logs.
+# Inspect's raw local logs contain sample metadata and sandbox stdin/stdout.
+version: 1
+eval: livecodebench
+
+global:
+  - credentials
+  - pii
+  - injection_payloads
+  - screenshots
+
+answers:
+  - metadata.public_test_cases
+  - metadata.private_test_cases
+  - expected_outputs
+  - reference_solution
+
+never_publish:
+  - anything_matching_credential_patterns
+  - sample_metadata
+  - public_test_cases
+  - private_test_cases
+  - decoded_test_cases
+  - expected_outputs
+  - sandbox_exec_stdin
+  - sandbox_exec_stdout
+  - sandbox_exec_stderr
+  - sandbox_transcripts
+  - model_generated_solutions
+
+eval_specific:
+  - pattern: 'public_test_cases'
+  - pattern: 'private_test_cases'
+
+snippet:
+  problem_statement: first_400_chars
+  trace: first_and_last_turn
+  include_answers: false

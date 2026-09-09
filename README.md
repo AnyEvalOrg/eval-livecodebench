@@ -50,28 +50,45 @@ Sample metadata is an allowlist of problem identity, platform, date and difficul
 No reference answer is placed in the sample target. The package does not choose
 upstream model-specific prompt variants or override the model's generation settings.
 
-The scorer extracts the **last closed `python` fenced block**. Each test uses two
+The scorer extracts the **last closed `python` fenced block**. Each test uses three
 bounded sandbox execs: setup atomically creates an unpredictable `/tmp/lcb-*`
 directory and a request file, then a supervisor reads and unlinks that request,
-writes the candidate once, and executes it once in that fresh directory. There are
+writes the candidate once, and executes it once in that fresh directory. A separate cleanup exec then kills
+every process with the reserved candidate UID before another test starts. There are
 no unbounded `write_file` operations or reused candidate-writable launch paths.
 The candidate has a **six-second timeout** by default, including process startup;
 `per_test_timeout` overrides it. Setup has a five-second container deadline. The run
 has an explicit container `timeout -s KILL`, an Inspect exec timeout, and an outer
 async deadline, with five seconds of supervisor overhead beyond the candidate limit.
 
-The nonroot Linux supervisor captures stdout/stderr in anonymous files and obtains
-the exit status from `wait()`. A hard zero `RLIMIT_NPROC` prevents candidate forks
-and threads; `no_new_privs` prevents privilege gains. The candidate starts in its own
-session, is killed and reaped on timeout, and receives `SIGKILL` if its supervisor
-dies. The supervisor also kills the original process group before returning a receipt.
-Thus a previous candidate cannot leave a process to poison the next test's setup.
+The trusted Linux supervisor runs as root and captures stdout/stderr in anonymous
+files, obtaining the exit status from `wait()`. Before exec it clears supplementary
+groups and irreversibly sets all real/effective/saved GIDs and UIDs to **65532**,
+with `no_new_privs` and no retained capabilities. Only the per-test `candidate/`
+subdirectory is candidate-owned; its unpredictable parent stays supervisor-owned.
+A hard zero `RLIMIT_NPROC` prevents candidate forks and threads. The different UID
+prevents the candidate from signaling the supervisor or the outer timeout process.
+
+The candidate starts in its own session. The supervisor sends **SIGTERM then SIGKILL
+to the whole process group**, and reaps the child on completion or timeout. Cleanup
+also has an independent enforcement path: the scorer always issues a separate
+sandbox exec running `/usr/bin/pkill -KILL -u 65532`, including on setup failure,
+execution failure, missing/invalid receipts and cancellation. If no authenticated
+receipt arrives, the scorer waits through the run's host deadline (candidate limit
+plus ten seconds) before sweeping, even if the provider returned early. An
+authenticated completion permits an immediate sweep. The cleanup exec has its own
+five-second container/provider deadline and ten-second host deadline; cleanup failure
+aborts scoring rather than starting another test. UID 65532 must be reserved solely
+for candidates in a per-sample sandbox; tests within that sandbox run sequentially.
+No parent-death signal or other candidate-controlled setting is used for cleanup.
+A test without an authenticated supervisor report is **INCORRECT**, with reason
+`supervisor did not complete`.
 
 A per-test HMAC-SHA256 receipt authenticates the actual child exit code, timeout,
 overflow, output bytes and directory. The setup process generates the key locally;
 no ancestor shell receives it as input or an argument. The request file is deleted
 before candidate execution, and `PR_SET_DUMPABLE=0` protects the supervisor's key
-and file descriptors from the same-UID child. Candidate stdout goes to its own file,
+and file descriptors in addition to the UID separation. Candidate stdout goes to its own file,
 not the provider's control stream. Printing a provider completion marker cannot
 forge a passing receipt: provider `success` and `returncode` are never verdicts.
 Expected outputs stay on the host and are never sent to the sandbox. Model code
@@ -94,8 +111,8 @@ at the same commit:
   a list, followed by Python equality with the JSON-decoded expected output.
 - Any wrong answer, timeout, output overflow or nonzero exit is incorrect. Explanations
   identify the failing test and reason without including tests, stdout or stderr.
-  Missing code is incorrect. Corrupt packaged data and infrastructure failures raise
-  errors instead of silently counting as model failures.
+  Missing code or an absent supervisor report is incorrect. Corrupt packaged data,
+  setup infrastructure errors and failed independent cleanup raise sanitized errors.
 
 Private test decoding follows `CodeGenerationProblem.__post_init__` in
 [`lcb_runner/benchmarks/code_generation.py`](https://github.com/LiveCodeBench/LiveCodeBench/blob/28fef95ea8c9f7a547c8329f2cd3d32b92c1fa24/lcb_runner/benchmarks/code_generation.py):
@@ -118,10 +135,20 @@ inspect eval livecodebench/livecodebench \
   --model <provider/model> -T sandbox_type=docker
 ```
 
-Docker and the `python:3.12-slim` image must be available; the initial image pull
-requires network access, but the running container uses `network_mode: none`.
-It runs as UID/GID 1000, drops capabilities, disallows privilege escalation and limits
-memory/process count. Evaluation data is in the wheel, not the image.
+Docker must be available. Compose builds the packaged `livecodebench/Dockerfile`
+as `eval-livecodebench-sandbox:local` from `python:3.12-slim`, installing `procps`
+for `/usr/bin/pkill` and reserving UID/GID 65532 as `lcb-candidate`. Image building
+requires network access; the running container uses `network_mode: none`.
+The image must provide `/usr/local/bin/python3`, GNU `timeout`, procps `pkill`, and
+a root-owned interpreter/system tree that UID 65532 cannot modify. Numeric IDs are
+fixed in the wrapper and cleanup command, so a custom image must reserve the same IDs.
+Evaluation data is in the wheel, not the image.
+
+Trusted setup, supervision and independent cleanup execs run as UID/GID 0 with
+all capabilities dropped except `SETUID`, `SETGID`, `KILL`, `CHOWN` and `DAC_OVERRIDE`
+(to drop candidate credentials, signal across UIDs, and manage candidate-owned
+scratch files). Privilege escalation remains disabled. The candidate receives none
+of these capabilities. Container memory and process limits remain in force.
 
 The distribution is `eval-livecodebench`, the module is `livecodebench`, and the
 `inspect_ai` entry point imports that module for cold task discovery. Python >=3.11
@@ -134,10 +161,19 @@ does not depend on, import, or wrap `inspect_evals`' LiveCodeBench-Pro implement
 
 The default Kubernetes configuration uses the packaged AnyEval chart and values.
 It creates one Python Pod and a standard namespace-wide deny-all NetworkPolicy,
-with no Cilium resources or DNS sidecar. It requests `python:3.12-slim`,
+with no Cilium resources or DNS sidecar. It requests the built `eval-livecodebench-sandbox:local` image,
 `runtimeClassName: gvisor`, node selector `anyeval.io/tier: sandbox`, no service-account
-token, nonroot execution and `restartPolicy: Never`, matching AnyEval's
-`sandbox-pod-template.yaml`. The values also follow the **0.13.0** provider schema.
+token and `restartPolicy: Never`. The UID separation required here replaces the
+previous all-nonroot configuration: trusted execs require UID 0 and the five
+capabilities above, while candidates run as UID 65532. A cluster policy requiring
+`runAsNonRoot: true` for the entire container must allow this explicit exception;
+that setting cannot enforce this supervisor/candidate split. The values follow
+the **0.13.0** provider schema.
+
+Before Kubernetes evaluation, build `livecodebench/Dockerfile`, push the resulting
+image to a registry accessible to the sandbox nodes, and set `services.default.image`
+in the packaged `values.yaml` to that registry reference (prefer a pinned digest).
+The `:local` default works only when that image is preloaded on the nodes.
 
 ```bash
 python -m pip install '.[anyeval]'
@@ -155,8 +191,7 @@ for other clusters. It requires Cilium CRDs and includes a CoreDNS sidecar; it i
 not the AnyEval deployment path. Docker selection needs only `-T sandbox_type=docker`.
 
 The provenance hook must still verify the **live** kernel, resolved image digests,
-node and selecting policies; values alone do not prove containment. The Python image
-tag is deliberately the requested plain image, so record its resolved digest per run.
+node and selecting policies; values alone do not prove containment. Record the resolved custom sandbox image digest per run.
 
 ## Build, test and publication
 
@@ -175,7 +210,16 @@ performs no dataset fetch. Tests need neither network nor Docker; scorer tests u
 fake sandbox, and adapter tests execute only authored synthetic fixtures in child Python
 processes. Pytest temporary files stay under `.build/`; authored supervisor fixtures
 also create and remove isolated `/tmp/lcb-*` directories. On macOS, those fixtures
-stub Linux `prctl` calls, and the real Linux containment test is skipped.
+stub Linux `prctl`, credential changes and group signaling; these are mechanics tests, not evidence
+of UID isolation. Linux containment regressions are skipped off Linux with explicit
+reasons. Run them as root **inside a disposable Linux sandbox** with the image
+requirements above, an otherwise-unused candidate UID 65532, and
+`LCB_LINUX_CONTAINMENT=1`. They verify blocked forks and supervisor-memory access,
+denied candidate signals to the supervisor after clearing `PDEATHSIG`, zero
+candidate capabilities, and termination by a separate UID-wide exec after the trusted
+test driver forcibly kills the supervisor. The scorer must return `supervisor did
+not complete`, no candidate may remain runnable, and a fresh subsequent test must pass.
+Linux/Docker containment has not been exercised on the macOS development host.
 
 `run.py` mirrors the reference package's one-problem contract. Pass one literal
 `--sample-id`, `--model`, `--scaffold baseline` and optional `--token-limit`;
@@ -186,7 +230,11 @@ bundle leaves serving receipts and live sandbox provenance absent; the AnyEval
 application must supply and verify those before publication.
 
 `anyeval.json` supplies discovery metadata. `redaction.yaml` records the enforced
-publication contract. AnyEval's current exporter does **not** load that YAML; it
+publication contract using schema `version: 1`, exact source test keys under
+`redact`, general answer keys under `global`, and
+`sandbox_exec: [input, stdout, stderr]`. Tests derive sensitive key coverage from
+loaded records and samples; current sample metadata has no answer-bearing keys.
+AnyEval's current exporter does **not** load that YAML; it
 recursively scrubs recognized answer-key names, including targets, score answers
 and explanations, but cannot strip generic sandbox input/output fields or the old
 `public_test_cases` / `private_test_cases` keys. The package therefore prevents those

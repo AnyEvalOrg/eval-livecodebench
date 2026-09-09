@@ -1,11 +1,15 @@
 services:
   default:
-    image: python:3.12-slim
+    image: eval-livecodebench-sandbox:local
+    build:
+      context: .
+      dockerfile: Dockerfile
     command: ["sleep", "infinity"]
     working_dir: /tmp
-    user: "1000:1000"
+    user: "0:0"
     network_mode: none
     cap_drop: [ALL]
+    cap_add: [SETUID, SETGID, KILL, CHOWN, DAC_OVERRIDE]
     security_opt:
       - no-new-privileges:true
     mem_limit: 1g

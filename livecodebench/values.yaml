@@ -10,7 +10,7 @@ allowEntities: []
 allowCIDR: []
 services:
   default:
-    image: python:3.12-slim
+    image: eval-livecodebench-sandbox:local
     command: ["sleep", "infinity"]
     workingDir: /tmp
     runtimeClassName: gvisor
@@ -18,12 +18,13 @@ services:
       anyeval.io/tier: sandbox
     networkIsolated: true
     securityContext:
-      runAsUser: 1000
-      runAsGroup: 1000
-      runAsNonRoot: true
+      runAsUser: 0
+      runAsGroup: 0
+      runAsNonRoot: false
       allowPrivilegeEscalation: false
       capabilities:
         drop: ["ALL"]
+        add: ["SETUID", "SETGID", "KILL", "CHOWN", "DAC_OVERRIDE"]
       seccompProfile:
         type: RuntimeDefault
     resources:

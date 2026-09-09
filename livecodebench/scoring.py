@@ -16,7 +16,7 @@ from inspect_ai.util import OutputLimitExceededError, sandbox
 
 from .dataset import decode_tests, load_records
 from .publication import private_grading
-from .sandbox_runner import RUNNER, SETUP
+from .sandbox_runner import CLEANUP_COMMAND, RUNNER, SETUP
 from .execution import functional_program, stdin_program
 
 # grade_stdio/get_stripped_lines/convert_line_to_decimals and grade_call_based,
@@ -89,39 +89,66 @@ def livecodebench_scorer(per_test_timeout: int = 6):
             # The setup process generates the key; no ancestor shell receives it.
             # The extra five seconds permit startup and authenticated receipt cleanup.
             deadline = per_test_timeout + 5
+            receipt = None
+            cleanup_after = 0
             try:
                 with private_grading(env) as private:
-                    async with asyncio.timeout(10):
-                        setup = await private.exec(
-                            ["timeout", "-s", "KILL", "5s",
-                             "/usr/local/bin/python3", "-I", "-c", SETUP],
-                            cwd="/", input=request, timeout=5, timeout_retry=False,
-                        )
-                    setup_receipt = json.loads(setup.stdout)
-                    work = setup_receipt["cwd"]
-                    key = bytes.fromhex(setup_receipt["key"])
-                    if len(key) != 32:
-                        raise RuntimeError("Invalid setup key")
-                    if not re.fullmatch(r"/tmp/lcb-[a-zA-Z0-9_-]+", work):
-                        raise RuntimeError("Invalid setup directory")
-                    async with asyncio.timeout(deadline + 5):
-                        result = await private.exec(
-                            ["timeout", "-s", "KILL", f"{deadline}s",
-                             "/usr/local/bin/python3", "-I", "-c", RUNNER, work],
-                            cwd="/", timeout=deadline, timeout_retry=False,
-                        )
+                    try:
+                        async with asyncio.timeout(10):
+                            setup = await private.exec(
+                                ["timeout", "-s", "KILL", "5s",
+                                 "/usr/local/bin/python3", "-I", "-c", SETUP],
+                                cwd="/", input=request, timeout=5, timeout_retry=False,
+                            )
+                        setup_receipt = json.loads(setup.stdout)
+                        work = setup_receipt["cwd"]
+                        key = bytes.fromhex(setup_receipt["key"])
+                        if len(key) != 32:
+                            raise RuntimeError("Invalid setup key")
+                        if not re.fullmatch(r"/tmp/lcb-[a-zA-Z0-9_-]+", work):
+                            raise RuntimeError("Invalid setup directory")
+                        # If exec returns early without a receipt, wait through
+                        # the outer deadline before sweeping: the supervisor may
+                        # still be starting. This uses the host monotonic clock.
+                        cleanup_after = asyncio.get_running_loop().time() + deadline + 5
+                        try:
+                            async with asyncio.timeout(deadline + 5):
+                                result = await private.exec(
+                                    ["timeout", "-s", "KILL", f"{deadline}s",
+                                     "/usr/local/bin/python3", "-I", "-c", RUNNER, work],
+                                    cwd="/", timeout=deadline, timeout_retry=False,
+                                )
+                            receipt = verify_receipt(result.stdout, key)
+                            if receipt is not None and receipt["cwd"] == work:
+                                # Authenticated completion means no later spawn;
+                                # sweep immediately before starting the next test.
+                                cleanup_after = 0
+                            else:
+                                receipt = None
+                        except Exception:
+                            # No authenticated supervisor report is a failed test,
+                            # including a killed supervisor or lost exec response.
+                            receipt = None
+                    finally:
+                        # A separate sandbox exec, never the candidate's parent or
+                        # session, enforces cleanup on EVERY path (also setup failure).
+                        cleanup = asyncio.create_task(cleanup_candidate(private, cleanup_after))
+                        try:
+                            await asyncio.shield(cleanup)
+                        except asyncio.CancelledError:
+                            await cleanup
+                            raise
             except TimeoutError:
-                return Score(value=INCORRECT, explanation=f"Test {index}: timeout ({per_test_timeout}s).")
+                return Score(value=INCORRECT, explanation=f"Test {index}: supervisor did not complete")
             except OutputLimitExceededError:
-                return Score(value=INCORRECT, explanation=f"Test {index}: output limit exceeded.")
+                return Score(value=INCORRECT, explanation=f"Test {index}: supervisor did not complete")
             except Exception:
                 # Provider exceptions may embed stdin or captured output. Do not
                 # allow them (or their exception chain) into an Inspect error event.
                 raise RuntimeError("Private sandbox operation failed; details withheld.") from None
-            receipt = verify_receipt(result.stdout, key)
-            # Neither success nor returncode from the provider is a verdict channel.
-            if receipt is None or receipt["cwd"] != work:
-                return Score(value=INCORRECT, explanation=f"Test {index}: invalid execution receipt.")
+            # Neither success nor returncode from the run provider is a verdict channel.
+            if receipt is None:
+                return Score(value=INCORRECT, explanation=f"Test {index}: supervisor did not complete")
             if receipt["timeout"]:
                 return Score(value=INCORRECT, explanation=f"Test {index}: timeout ({per_test_timeout}s).")
             if receipt["overflow"]:
@@ -143,6 +170,23 @@ def livecodebench_scorer(per_test_timeout: int = 6):
         raise RuntimeError("Private scoring failed; details withheld.") from None
 
     return score
+
+
+async def cleanup_candidate(environment, not_before: float = 0) -> None:
+    """Trusted, independent UID sweep; never proceed if cleanup itself fails."""
+    try:
+        delay = not_before - asyncio.get_running_loop().time()
+        if delay > 0:
+            await asyncio.sleep(delay)
+        async with asyncio.timeout(10):
+            cleanup = await environment.exec(
+                list(CLEANUP_COMMAND), cwd="/", timeout=5, timeout_retry=False,
+            )
+        if cleanup.returncode not in (0, 1):
+            raise RuntimeError("UID cleanup failed")
+    except Exception:
+        # In particular do not turn a cleanup timeout into a candidate verdict.
+        raise RuntimeError("Private sandbox cleanup failed; details withheld.") from None
 
 
 def verify_receipt(stdout: str, key: bytes) -> dict | None:

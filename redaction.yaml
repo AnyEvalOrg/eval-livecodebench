@@ -1,37 +1,11 @@
-# Executable enforcement is in livecodebench/publication.py and scoring.py.
-# AnyEval app/runner.py does NOT load this file. Its recursive key scrub matches
-# target(s), answer, explanation and keys containing gold/solution/reference_answer/
-# correct_answer/ground_truth/test_patch/gold_patch/flag. It does not match sandbox
-# input/output, public_test_cases, or private_test_cases at any nesting depth.
+# Consumer schema v1: exact keys apply recursively; sandbox_exec is event-scoped.
+# Samples currently carry only identity metadata. These structured-test keys are
+# the actual loaded record keys, retained defensively if metadata changes later.
 version: 1
-eval: livecodebench
-
-enforcement:
-  sample_metadata: allowlist_only
-  metadata_allowlist: [question_id, question_title, platform, contest_date, difficulty]
-  structured_tests: scorer_closure_only
-  expected_outputs: scorer_closure_only_never_sent_to_sandbox
-  sandbox_events: disabled_for_grading_via_dedicated_inspect_proxy
-  provider_diagnostics: context_filtered_during_grading
-  infrastructure_errors: fixed_message_without_exception_chain
-
-answers: [target, targets, answer, explanation]
-never_publish:
+redact:
   - public_test_cases
   - private_test_cases
-  - decoded_test_cases
-  - expected_outputs
-  - grading_sandbox_input
-  - grading_sandbox_output
-  - grading_sandbox_stderr
-  - execution_receipt_key
-
-published:
-  - original_statement_and_embedded_examples
-  - starter_code
-  - model_messages_and_candidate_code
-  - allowlisted_problem_identity
-  - scalar_verdict
-  - model_usage_cost_timing_and_live_sandbox_provenance
-# Embedded examples are already part of the official model prompt. Candidate code
-# is the model's attempt, not a dataset reference solution or a structured test key.
+global: [target, targets, answer, explanation]
+sandbox_exec: [input, stdout, stderr]
+# Runtime event suppression and metadata allowlisting remain in publication.py
+# and task.py; they protect exporters that do not yet consume this declaration.

@@ -23,6 +23,8 @@ class FakeSandbox:
             self.requests.append(json.loads(input))
             self.paths.append(f"/tmp/lcb-fresh_{len(self.paths)}")
             return result(json.dumps({"cwd": self.paths[-1], "key": self.key.hex()}))
+        if cmd == scoring.CLEANUP_COMMAND:
+            return result("", returncode=1)
         response = next(self.results)
         if isinstance(response, Exception):
             raise response
@@ -58,6 +60,10 @@ def record(kind="stdin", expected="2", test_input="1"):
 @pytest.fixture(autouse=True)
 def synthetic_records(monkeypatch):
     monkeypatch.setattr(scoring, "load_records", lambda: [record()])
+    # No wall-clock waits in fake provider tests; Linux tests use real deadlines.
+    async def no_sleep(delay):
+        pass
+    monkeypatch.setattr(scoring.asyncio, "sleep", no_sleep)
 
 
 def install_sandbox(monkeypatch, fake):
@@ -70,7 +76,7 @@ def result(stdout="2", returncode=0):
 
 
 @pytest.mark.parametrize("kind", ["stdin", "functional"])
-@pytest.mark.parametrize("outcome,reason", [("correct", "All 2"), ("wrong", "wrong answer"), ("timeout", "timeout"), ("runtime", "runtime error")])
+@pytest.mark.parametrize("outcome,reason", [("correct", "All 2"), ("wrong", "wrong answer"), ("timeout", "supervisor did not complete"), ("runtime", "runtime error")])
 def test_scorer_results_with_fake_sandbox(monkeypatch, kind, outcome, reason):
     monkeypatch.setattr(scoring, "load_records", lambda: [record(kind)])
     response = {
@@ -83,9 +89,12 @@ def test_scorer_results_with_fake_sandbox(monkeypatch, kind, outcome, reason):
     assert score.value == (CORRECT if outcome == "correct" else INCORRECT)
     assert reason in score.explanation
     count = 2 if outcome == "correct" else 1
-    assert len(fake.calls) == count * 2
+    assert len(fake.calls) == count * 3
     assert len(set(fake.paths)) == count
-    for setup, run in zip(fake.calls[::2], fake.calls[1::2]):
+    for setup, run, cleanup in zip(fake.calls[::3], fake.calls[1::3], fake.calls[2::3]):
+        assert cleanup[0] == scoring.CLEANUP_COMMAND
+        assert cleanup[1]["timeout"] == 5
+        assert cleanup[1]["timeout_retry"] is False
         assert setup[0][:4] == ["timeout", "-s", "KILL", "5s"]
         assert setup[1]["timeout"] == 5
         assert run[0][:4] == ["timeout", "-s", "KILL", "11s"]
@@ -178,11 +187,13 @@ def test_empty_test_suite_is_an_error(monkeypatch):
         asyncio.run(scoring.livecodebench_scorer()(task_state, Target("")))
 
 
-def test_infrastructure_errors_propagate(monkeypatch):
+def test_lost_supervisor_response_is_incorrect(monkeypatch):
     fake = FakeSandbox([ConnectionError("cluster unavailable")])
     install_sandbox(monkeypatch, fake)
-    with pytest.raises(RuntimeError, match="details withheld"):
-        asyncio.run(scoring.livecodebench_scorer()(state("stdin"), Target("")))
+    score = asyncio.run(scoring.livecodebench_scorer()(state("stdin"), Target("")))
+    assert score.value == INCORRECT
+    assert score.explanation == "Test 1: supervisor did not complete"
+    assert fake.calls[-1][0] == scoring.CLEANUP_COMMAND
 
 
 @pytest.mark.parametrize("kind", ["stdin", "functional"])
@@ -191,7 +202,7 @@ def test_output_limit_is_incorrect(monkeypatch, kind):
     install_sandbox(monkeypatch, fake)
     score = asyncio.run(scoring.livecodebench_scorer()(state(kind), Target("")))
     assert score.value == INCORRECT
-    assert "output limit" in score.explanation
+    assert "supervisor did not complete" in score.explanation
 
 
 @pytest.mark.parametrize("forgery", [
@@ -204,7 +215,7 @@ def test_forged_completion_marker_or_receipt_is_incorrect(monkeypatch, forgery):
     install_sandbox(monkeypatch, fake)
     score = asyncio.run(scoring.livecodebench_scorer()(state(), Target("")))
     assert score.value == INCORRECT
-    assert "invalid execution receipt" in score.explanation
+    assert "supervisor did not complete" in score.explanation
 
 
 def test_marker_inside_captured_candidate_output_cannot_hide_failure(monkeypatch):
@@ -234,6 +245,8 @@ def test_authenticated_failure_channels(monkeypatch, field, value):
 def test_setup_timeout_is_bounded_and_incorrect(monkeypatch):
     class HungSetup(FakeSandbox):
         async def exec(self, cmd, **kwargs):
+            if cmd == scoring.CLEANUP_COMMAND:
+                return await super().exec(cmd, **kwargs)
             assert cmd[:4] == ["timeout", "-s", "KILL", "5s"]
             assert kwargs["timeout"] == 5
             raise TimeoutError("private material")
@@ -241,3 +254,94 @@ def test_setup_timeout_is_bounded_and_incorrect(monkeypatch):
     score = asyncio.run(scoring.livecodebench_scorer()(state(), Target("")))
     assert score.value == INCORRECT
     assert "private material" not in score.explanation
+
+
+@pytest.mark.parametrize('response', [result(), result('3'), result(returncode=7), '',
+                                      TimeoutError(), ConnectionError(),
+                                      OutputLimitExceededError('synthetic', None)])
+def test_uid_cleanup_is_a_separate_exec_on_every_run_outcome(monkeypatch, response):
+    fake = FakeSandbox([response, response])
+    install_sandbox(monkeypatch, fake)
+    asyncio.run(scoring.livecodebench_scorer()(state(), Target('')))
+    runs = [i for i, (cmd, _) in enumerate(fake.calls) if scoring.RUNNER in cmd]
+    assert runs
+    for index in runs:
+        cmd, kwargs = fake.calls[index + 1]
+        assert cmd == scoring.CLEANUP_COMMAND
+        assert cmd[-4:] == ['/usr/bin/pkill', '-KILL', '-u', '65532']
+        assert kwargs['input'] is None and kwargs['cwd'] == '/'
+        assert kwargs['timeout'] == 5 and kwargs['timeout_retry'] is False
+
+
+def test_missing_receipt_waits_through_host_deadline_before_uid_sweep(monkeypatch):
+    events = []
+
+    async def wait(delay):
+        assert 15 <= delay <= 16  # default run deadline (11s) + host grace (5s)
+        events.append('deadline')
+
+    class MissingSupervisor(FakeSandbox):
+        async def exec(self, cmd, **kwargs):
+            if cmd == scoring.CLEANUP_COMMAND:
+                assert events == ['deadline']
+                events.append('sweep')
+            return await super().exec(cmd, **kwargs)
+
+    monkeypatch.setattr(scoring.asyncio, 'sleep', wait)
+    fake = MissingSupervisor([''])
+    install_sandbox(monkeypatch, fake)
+    score = asyncio.run(scoring.livecodebench_scorer()(state(), Target('')))
+    assert score.value == INCORRECT
+    assert score.explanation == 'Test 1: supervisor did not complete'
+    assert events == ['deadline', 'sweep']
+
+
+@pytest.mark.parametrize('failure', [TimeoutError(), ConnectionError(), result('', returncode=2)])
+def test_cleanup_failure_aborts_before_next_test(monkeypatch, failure):
+    class FailedCleanup(FakeSandbox):
+        async def exec(self, cmd, **kwargs):
+            if cmd == scoring.CLEANUP_COMMAND:
+                self.calls.append((cmd, kwargs))
+                if isinstance(failure, Exception):
+                    raise failure
+                return failure
+            return await super().exec(cmd, **kwargs)
+
+    fake = FailedCleanup([result()])
+    install_sandbox(monkeypatch, fake)
+    with pytest.raises(RuntimeError, match='details withheld'):
+        asyncio.run(scoring.livecodebench_scorer()(state(), Target('')))
+    assert len(fake.paths) == 1
+    assert fake.calls[-1][0] == scoring.CLEANUP_COMMAND
+
+
+def test_scorer_cancellation_still_awaits_independent_uid_sweep(monkeypatch):
+    class CancelledRun(FakeSandbox):
+        async def exec(self, cmd, **kwargs):
+            if scoring.RUNNER in cmd:
+                raise asyncio.CancelledError()
+            return await super().exec(cmd, **kwargs)
+
+    fake = CancelledRun([])
+    install_sandbox(monkeypatch, fake)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(scoring.livecodebench_scorer()(state(), Target('')))
+    assert fake.calls[-1][0] == scoring.CLEANUP_COMMAND
+
+
+@pytest.mark.parametrize('failure', [TimeoutError(), ConnectionError()])
+def test_setup_failure_also_issues_uid_cleanup(monkeypatch, failure):
+    class FailedSetup(FakeSandbox):
+        async def exec(self, cmd, **kwargs):
+            if scoring.SETUP in cmd:
+                raise failure
+            return await super().exec(cmd, **kwargs)
+
+    fake = FailedSetup([])
+    install_sandbox(monkeypatch, fake)
+    if isinstance(failure, TimeoutError):
+        assert asyncio.run(scoring.livecodebench_scorer()(state(), Target(''))).value == INCORRECT
+    else:
+        with pytest.raises(RuntimeError, match='details withheld'):
+            asyncio.run(scoring.livecodebench_scorer()(state(), Target('')))
+    assert fake.calls[-1][0] == scoring.CLEANUP_COMMAND

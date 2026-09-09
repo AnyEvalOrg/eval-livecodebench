@@ -92,12 +92,37 @@ def test_any_eval_does_not_scrub_generic_sandbox_fields(redact_export):
     assert published['events'][0]['output'] == 'synthetic'
 
 
-def test_policy_matches_enforced_contract():
+def test_policy_uses_consumer_schema_and_covers_loaded_answer_metadata():
+    import re
+    import jsonschema
+    from livecodebench.dataset import load_records
+
+    key_list = {"type": "array", "items": {"type": "string"}, "uniqueItems": True}
+    schema = {
+        "type": "object", "additionalProperties": False,
+        "required": ["version", "redact", "sandbox_exec"],
+        "properties": {
+            "version": {"type": "integer", "const": 1},
+            **{name: key_list for name in ("redact", "global", "never_publish")},
+            "sandbox_exec": {"type": "array", "uniqueItems": True,
+                             "items": {"enum": ["input", "stdout", "stderr"]}},
+        },
+    }
     policy = yaml.safe_load(Path('redaction.yaml').read_text())
-    sample = record_to_sample(dict(record(), question_content='Fixture.', starter_code=''))
-    assert set(sample.metadata) <= set(policy['enforcement']['metadata_allowlist'])
-    assert policy['enforcement']['structured_tests'] == 'scorer_closure_only'
-    assert policy['enforcement']['sandbox_events'] == 'disabled_for_grading_via_dedicated_inspect_proxy'
+    jsonschema.validate(policy, schema)
+    assert set(policy['sandbox_exec']) == {'input', 'stdout', 'stderr'}
+    # Discover exact keys from the loader, rather than reproducing a list of
+    # presumed metadata fields in the YAML test. Check records as well as samples:
+    # today's allowlist makes sample-only answer coverage otherwise vacuous.
+    answer_name = re.compile(r'test_cases|decoded_tests|expected|answer|target|gold|solution|ground_truth|test_patch|flag')
+    loaded_answer_keys = set()
+    for loaded in load_records():
+        loaded_answer_keys.update(key for key in loaded if answer_name.search(key))
+        sample = record_to_sample(loaded)
+        metadata_answers = {key for key in sample.metadata if answer_name.search(key)}
+        assert metadata_answers <= set(policy['redact'])
+    assert loaded_answer_keys  # non-vacuous coverage of actual source answer fields
+    assert loaded_answer_keys == set(policy['redact'])
 
 
 def test_private_proxy_does_not_disable_public_provenance_or_other_contexts(caplog):

@@ -15,9 +15,11 @@ def test_docker_task_builds_offline():
     assert Path(task.sandbox.config).is_file()
     config = yaml.safe_load(Path(task.sandbox.config).read_text())
     service = config["services"]["default"]
-    assert service["image"] == "python:3.12-slim"
+    assert service["image"] == "eval-livecodebench-sandbox:local"
+    assert service["build"]["dockerfile"] == "Dockerfile"
+    assert set(service["cap_add"]) == {"SETUID", "SETGID", "KILL", "CHOWN", "DAC_OVERRIDE"}
     assert service["network_mode"] == "none"
-    assert service["user"] == "1000:1000"
+    assert service["user"] == "0:0"
     assert not task.dataset[0].target
 
 
@@ -30,9 +32,9 @@ def test_default_k8s_values_match_anyeval_contract():
     assert values["automountServiceAccountToken"] is False
     assert service["runtimeClassName"] == "gvisor"
     assert service["nodeSelector"] == {"anyeval.io/tier": "sandbox"}
-    assert service["image"] == "python:3.12-slim"
+    assert service["image"] == "eval-livecodebench-sandbox:local"
     assert service["networkIsolated"] is True
-    assert service["securityContext"]["runAsNonRoot"] is True
+    assert service["securityContext"]["runAsNonRoot"] is False
     assert service["securityContext"]["allowPrivilegeEscalation"] is False
     assert service["securityContext"]["capabilities"]["drop"] == ["ALL"]
     for key in ("allowDomains", "allowEntities", "allowCIDR"):
@@ -101,7 +103,9 @@ def test_render_default_chart_matches_anyeval_pod_contract():
     assert spec["restartPolicy"] == "Never"
     assert len(spec["containers"]) == 1
     security = spec["containers"][0]["securityContext"]
-    assert security["runAsNonRoot"] is True
+    assert security["runAsUser"] == security["runAsGroup"] == 0
+    assert set(security["capabilities"]["add"]) == {"SETUID", "SETGID", "KILL", "CHOWN", "DAC_OVERRIDE"}
+    assert security["runAsNonRoot"] is False
     assert security["allowPrivilegeEscalation"] is False
     assert security["capabilities"]["drop"] == ["ALL"]
     policy = next(r for r in resources if r and r["kind"] == "NetworkPolicy")

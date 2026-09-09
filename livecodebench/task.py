@@ -1,7 +1,7 @@
 """LiveCodeBench code generation as an offline AnyEval/Inspect task."""
 from __future__ import annotations
 
-import json
+import os
 from importlib.resources import files
 from pathlib import Path
 
@@ -16,8 +16,9 @@ from .scoring import livecodebench_scorer
 
 def record_to_sample(record: dict) -> Sample:
     # Explicit allowlist: no metadata or test fields participate in rendering input.
-    metadata = {key: value for key, value in record.items() if key not in {"question_content", "starter_code", "metadata"}}
-    metadata.update(json.loads(record["metadata"]))
+    metadata = {key: record[key] for key in (
+        "question_id", "question_title", "platform", "contest_date", "difficulty"
+    ) if key in record}
     return Sample(
         id=record["question_id"],
         input=user_prompt(record["question_content"], record["starter_code"] or ""),
@@ -36,22 +37,23 @@ def load_dataset() -> MemoryDataset:
 def livecodebench(
     sandbox_type: str = "k8s",
     per_test_timeout: int = 6,
-    anyeval_chart: bool = False,
+    anyeval_chart: bool = True,
 ) -> Task:
     """One generation, one epoch, all-tests pass@1.
 
     sandbox_type: k8s (default) or docker.
     per_test_timeout: Seconds per test, including process startup (dataset has no limits).
-    anyeval_chart: Use the packaged, sidecar-free standard-NetworkPolicy chart on AnyEval's Calico cluster.
+    anyeval_chart: Default AnyEval chart; false explicitly selects the provider's Cilium chart. Ignored for Docker.
     """
     if sandbox_type not in {"k8s", "docker"}:
         raise ValueError("sandbox_type must be k8s or docker")
     resources = files("livecodebench")
     config = str(resources.joinpath("values.yaml" if sandbox_type == "k8s" else "compose.yaml"))
-    if anyeval_chart:
-        if sandbox_type != "k8s":
-            raise ValueError("anyeval_chart requires sandbox_type=k8s")
+    if anyeval_chart and sandbox_type == "k8s":
         from k8s_sandbox import K8sSandboxEnvironmentConfig
+
+        # Provider 0.13.0 exposes namespace only through this environment setting.
+        os.environ.setdefault("INSPECT_K8S_DEFAULT_NAMESPACE", "anyeval-sandbox")
 
         config = K8sSandboxEnvironmentConfig(
             chart=str(resources.joinpath("chart")),

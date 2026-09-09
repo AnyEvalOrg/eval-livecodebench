@@ -2,6 +2,10 @@
 from __future__ import annotations
 
 import ast
+import asyncio
+import base64
+import hashlib
+import hmac
 import json
 import re
 from decimal import Decimal, InvalidOperation
@@ -10,7 +14,9 @@ from inspect_ai.scorer import CORRECT, INCORRECT, Score, Target, accuracy, score
 from inspect_ai.solver import TaskState
 from inspect_ai.util import OutputLimitExceededError, sandbox
 
-from .dataset import decode_tests
+from .dataset import decode_tests, load_records
+from .publication import private_grading
+from .sandbox_runner import RUNNER, SETUP
 from .execution import functional_program, stdin_program
 
 # grade_stdio/get_stripped_lines/convert_line_to_decimals and grade_call_based,
@@ -56,42 +62,103 @@ def livecodebench_scorer(per_test_timeout: int = 6):
     if per_test_timeout <= 0:
         raise ValueError("per_test_timeout must be positive")
 
-    async def score(state: TaskState, target: Target) -> Score:
+    # Closure data is not a scorer argument (Inspect logs scorer arguments), sample
+    # metadata, target, or store. Only the selected record is decoded when scoring.
+    records = {record["question_id"]: record for record in load_records()}
+
+    async def private_score(state: TaskState, target: Target) -> Score:
         code = extract_code(state.output.completion)
         if code is None:
             return Score(value=INCORRECT, explanation="No nonempty, closed python fenced block.")
-        metadata = state.metadata
-        tests = decode_tests(metadata["public_test_cases"]) + decode_tests(metadata["private_test_cases"])
+        record = records[str(state.sample_id)]
+        tests = decode_tests(record["public_test_cases"]) + decode_tests(record["private_test_cases"])
         if not tests:
             raise ValueError("Packaged problem has no tests")
-        fn_name = metadata.get("func_name")
+        fn_name = json.loads(record["metadata"]).get("func_name")
         env = sandbox()
         for index, test in enumerate(tests, 1):
             functional = test["testtype"] == "functional"
             if functional and not fn_name:
                 raise ValueError("Functional problem is missing func_name")
             program = functional_program(code, fn_name) if functional else stdin_program(code)
-            # Rewrite for every test: candidate modifications cannot replace the next
-            # solution. No expected output, test suite or grading code is written here.
-            await env.write_file("/tmp/solution.py", program)
+            request = json.dumps({
+                "program": program, "input": test["input"],
+                "timeout": per_test_timeout, "output_limit": 1024 * 1024,
+            })
+            # Both setup and execution have container and host deadlines.
+            # The setup process generates the key; no ancestor shell receives it.
+            # The extra five seconds permit startup and authenticated receipt cleanup.
+            deadline = per_test_timeout + 5
             try:
-                result = await env.exec(
-                    ["python3", "solution.py"],
-                    cwd="/tmp",
-                    input=test["input"],
-                    timeout=per_test_timeout,
-                    timeout_retry=False,
-                )
+                with private_grading(env) as private:
+                    async with asyncio.timeout(10):
+                        setup = await private.exec(
+                            ["timeout", "-s", "KILL", "5s",
+                             "/usr/local/bin/python3", "-I", "-c", SETUP],
+                            cwd="/", input=request, timeout=5, timeout_retry=False,
+                        )
+                    setup_receipt = json.loads(setup.stdout)
+                    work = setup_receipt["cwd"]
+                    key = bytes.fromhex(setup_receipt["key"])
+                    if len(key) != 32:
+                        raise RuntimeError("Invalid setup key")
+                    if not re.fullmatch(r"/tmp/lcb-[a-zA-Z0-9_-]+", work):
+                        raise RuntimeError("Invalid setup directory")
+                    async with asyncio.timeout(deadline + 5):
+                        result = await private.exec(
+                            ["timeout", "-s", "KILL", f"{deadline}s",
+                             "/usr/local/bin/python3", "-I", "-c", RUNNER, work],
+                            cwd="/", timeout=deadline, timeout_retry=False,
+                        )
             except TimeoutError:
                 return Score(value=INCORRECT, explanation=f"Test {index}: timeout ({per_test_timeout}s).")
             except OutputLimitExceededError:
                 return Score(value=INCORRECT, explanation=f"Test {index}: output limit exceeded.")
-            if not result.success:
-                # Do not echo stderr: it can contain private inputs or candidate echoes.
-                return Score(value=INCORRECT, explanation=f"Test {index}: runtime error (exit {result.returncode}).")
+            except Exception:
+                # Provider exceptions may embed stdin or captured output. Do not
+                # allow them (or their exception chain) into an Inspect error event.
+                raise RuntimeError("Private sandbox operation failed; details withheld.") from None
+            receipt = verify_receipt(result.stdout, key)
+            # Neither success nor returncode from the provider is a verdict channel.
+            if receipt is None or receipt["cwd"] != work:
+                return Score(value=INCORRECT, explanation=f"Test {index}: invalid execution receipt.")
+            if receipt["timeout"]:
+                return Score(value=INCORRECT, explanation=f"Test {index}: timeout ({per_test_timeout}s).")
+            if receipt["overflow"]:
+                return Score(value=INCORRECT, explanation=f"Test {index}: output limit exceeded.")
+            if receipt["returncode"] != 0:
+                return Score(value=INCORRECT, explanation=f"Test {index}: runtime error (exit {receipt['returncode']}).")
             matches = functional_matches if functional else stdio_matches
-            if not matches(result.stdout, test["output"]):
+            if not matches(receipt["output"], test["output"]):
                 return Score(value=INCORRECT, explanation=f"Test {index}: wrong answer.")
         return Score(value=CORRECT, explanation=f"All {len(tests)} tests passed.")
 
+    async def score(state: TaskState, target: Target) -> Score:
+        # Raise outside the private frame and except block: even Inspect's optional
+        # traceback-locals display must not render records, requests, keys or output.
+        try:
+            return await private_score(state, target)
+        except Exception:
+            pass
+        raise RuntimeError("Private scoring failed; details withheld.") from None
+
     return score
+
+
+def verify_receipt(stdout: str, key: bytes) -> dict | None:
+    """Authenticate exact wrapper bytes before interpreting status or output."""
+    try:
+        envelope = json.loads(stdout)
+        body, tag = envelope["body"], envelope["tag"]
+        if not hmac.compare_digest(hmac.new(key, body.encode(), hashlib.sha256).hexdigest(), tag):
+            return None
+        receipt = json.loads(body)
+        if (type(receipt["returncode"]) is not int
+                or type(receipt["timeout"]) is not bool
+                or type(receipt["overflow"]) is not bool
+                or not re.fullmatch(r"/tmp/lcb-[a-zA-Z0-9_-]+", receipt["cwd"])):
+            return None
+        receipt["output"] = base64.b64decode(receipt["output"], validate=True).decode("utf-8")
+        return receipt
+    except (ValueError, TypeError, KeyError, AttributeError, UnicodeError):
+        return None

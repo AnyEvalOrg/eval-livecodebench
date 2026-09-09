@@ -45,16 +45,37 @@ commit `28fef95ea8c9f7a547c8329f2cd3d32b92c1fa24`. Both the starter-code and std
 instructions, Python fences, headings, spaces and newlines are preserved. The model
 receives only the original statement, optional starter code, and those instructions.
 Original examples embedded in the statement remain intact to preserve the official
-prompt; structured public/private tests and outputs are exclusively sample metadata.
+prompt; structured public/private tests and outputs stay only in the scorer closure.
+Sample metadata is an allowlist of problem identity, platform, date and difficulty.
 No reference answer is placed in the sample target. The package does not choose
 upstream model-specific prompt variants or override the model's generation settings.
 
-The scorer extracts the **last closed `python` fenced block**. Each test rewrites
-`/tmp/solution.py` inside Inspect's sandbox and runs `python3 solution.py` with that
-test's input on stdin, with a **six-second timeout** by default. This dataset has no
-per-problem time limits; `per_test_timeout` can override the default. Expected outputs
-stay in the trusted scorer and are never written into the sandbox. Model code never
-executes in the harness process.
+The scorer extracts the **last closed `python` fenced block**. Each test uses two
+bounded sandbox execs: setup atomically creates an unpredictable `/tmp/lcb-*`
+directory and a request file, then a supervisor reads and unlinks that request,
+writes the candidate once, and executes it once in that fresh directory. There are
+no unbounded `write_file` operations or reused candidate-writable launch paths.
+The candidate has a **six-second timeout** by default, including process startup;
+`per_test_timeout` overrides it. Setup has a five-second container deadline. The run
+has an explicit container `timeout -s KILL`, an Inspect exec timeout, and an outer
+async deadline, with five seconds of supervisor overhead beyond the candidate limit.
+
+The nonroot Linux supervisor captures stdout/stderr in anonymous files and obtains
+the exit status from `wait()`. A hard zero `RLIMIT_NPROC` prevents candidate forks
+and threads; `no_new_privs` prevents privilege gains. The candidate starts in its own
+session, is killed and reaped on timeout, and receives `SIGKILL` if its supervisor
+dies. The supervisor also kills the original process group before returning a receipt.
+Thus a previous candidate cannot leave a process to poison the next test's setup.
+
+A per-test HMAC-SHA256 receipt authenticates the actual child exit code, timeout,
+overflow, output bytes and directory. The setup process generates the key locally;
+no ancestor shell receives it as input or an argument. The request file is deleted
+before candidate execution, and `PR_SET_DUMPABLE=0` protects the supervisor's key
+and file descriptors from the same-UID child. Candidate stdout goes to its own file,
+not the provider's control stream. Printing a provider completion marker cannot
+forge a passing receipt: provider `success` and `returncode` are never verdicts.
+Expected outputs stay on the host and are never sent to the sandbox. Model code
+never executes in the harness process.
 
 The comparison and functional adapter are ported from
 [`lcb_runner/evaluation/testing_util.py`](https://github.com/LiveCodeBench/LiveCodeBench/blob/28fef95ea8c9f7a547c8329f2cd3d32b92c1fa24/lcb_runner/evaluation/testing_util.py)
@@ -83,7 +104,8 @@ JSON, or base64 → zlib → pickled JSON → JSON. Our unpickler rejects execut
 **Comparison limits:** this is a date subset, not the full cumulative leaderboard set.
 The requested real-stdin subprocess design differs from upstream's AST wrapper and
 mock stdin; each test also gets a fresh module/`Solution` rather than upstream's
-reused object. Startup counts toward the timeout, and sandboxes have 1 CPU/1 GiB RAM.
+reused object. Candidates cannot create subprocesses or threads. Output is limited
+to 1 MiB per stream. Startup counts toward the timeout, and sandboxes have 1 CPU/1 GiB RAM.
 These execution differences, model sampling settings and hardware should accompany
 reported scores. Matching the generic prompt and comparison rules does not guarantee
 numerical equivalence with every leaderboard run.
@@ -110,26 +132,28 @@ does not depend on, import, or wrap `inspect_evals`' LiveCodeBench-Pro implement
 
 ## Kubernetes and AnyEval
 
-The default declaration is `sandbox=("k8s", <installed livecodebench/values.yaml>)`.
-The values request `python:3.12-slim`, `runtimeClassName: gvisor`, node selector
-`anyeval.io/tier: sandbox`, no service-account token, nonroot execution and no network.
-The values follow the **0.13.0** provider schema. Its built-in chart requires Cilium
-CRDs, adds a CoreDNS sidecar, and uses `networkIsolated: true` to deny even DNS traffic.
-A standard deny-all NetworkPolicy is also emitted for AnyEval's provenance hook.
-
-For **AnyEval's Calico cluster**, use the packaged custom chart, which creates one
-Python Pod and a standard NetworkPolicy with no Cilium resources or DNS sidecar:
+The default Kubernetes configuration uses the packaged AnyEval chart and values.
+It creates one Python Pod and a standard namespace-wide deny-all NetworkPolicy,
+with no Cilium resources or DNS sidecar. It requests `python:3.12-slim`,
+`runtimeClassName: gvisor`, node selector `anyeval.io/tier: sandbox`, no service-account
+token, nonroot execution and `restartPolicy: Never`, matching AnyEval's
+`sandbox-pod-template.yaml`. The values also follow the **0.13.0** provider schema.
 
 ```bash
 python -m pip install '.[anyeval]'
-export INSPECT_K8S_DEFAULT_NAMESPACE=anyeval-sandbox
-inspect eval livecodebench/livecodebench \
-  --model <provider/model> -T anyeval_chart=true
+inspect eval livecodebench/livecodebench --model <provider/model>
 ```
 
-This option retains the same packaged values and matches AnyEval's
-`sandbox-pod-template.yaml`, including `restartPolicy: Never`. The cluster must provide
-the gVisor runtime, sandbox node pool and enforcing network-policy implementation.
+The task defaults `INSPECT_K8S_DEFAULT_NAMESPACE` to `anyeval-sandbox` when unset;
+the provider exposes namespace selection only through that setting. An explicit
+namespace setting is retained. The cluster must provide the namespace, gVisor
+runtime, sandbox node pool and enforcing network-policy implementation. AnyEval's
+existing namespace-wide `deny-all-egress` policy remains in force as well.
+
+`-T anyeval_chart=false` explicitly selects the provider's built-in Cilium chart
+for other clusters. It requires Cilium CRDs and includes a CoreDNS sidecar; it is
+not the AnyEval deployment path. Docker selection needs only `-T sandbox_type=docker`.
+
 The provenance hook must still verify the **live** kernel, resolved image digests,
 node and selecting policies; values alone do not prove containment. The Python image
 tag is deliberately the requested plain image, so record its resolved digest per run.
@@ -149,7 +173,9 @@ into an ignored gzip cache, and never executes the upstream dataset builder. No 
 download is committed. A normal wheel build uses the already committed artifact and
 performs no dataset fetch. Tests need neither network nor Docker; scorer tests use a
 fake sandbox, and adapter tests execute only authored synthetic fixtures in child Python
-processes. Temporary test files stay under `.build/`.
+processes. Pytest temporary files stay under `.build/`; authored supervisor fixtures
+also create and remove isolated `/tmp/lcb-*` directories. On macOS, those fixtures
+stub Linux `prctl` calls, and the real Linux containment test is skipped.
 
 `run.py` mirrors the reference package's one-problem contract. Pass one literal
 `--sample-id`, `--model`, `--scaffold baseline` and optional `--token-limit`;
@@ -159,10 +185,25 @@ containing only identity, status and score, without test material. The standalon
 bundle leaves serving receipts and live sandbox provenance absent; the AnyEval
 application must supply and verify those before publication.
 
-`anyeval.json` supplies discovery metadata. `redaction.yaml` is a publication policy,
-not an automatic filter: publishers must remove structured tests, sample metadata and
-sandbox transcripts before publishing. Raw Inspect logs contain test material even
-though the model prompt and score explanation do not expose those metadata fields.
+`anyeval.json` supplies discovery metadata. `redaction.yaml` records the enforced
+publication contract. AnyEval's current exporter does **not** load that YAML; it
+recursively scrubs recognized answer-key names, including targets, score answers
+and explanations, but cannot strip generic sandbox input/output fields or the old
+`public_test_cases` / `private_test_cases` keys. The package therefore prevents those
+fields from entering logs: tests live in the scorer closure; grading uses a dedicated
+Inspect proxy with events disabled; provider diagnostics are filtered within the
+grading context; infrastructure exceptions are replaced outside the private frame,
+without their original chain or private traceback locals. These private Inspect
+interfaces are version-pinned and covered by tests using the real event proxy and,
+when available, AnyEval's real `redact_export`.
+
+Published transcripts retain the original statement and its embedded examples,
+starter code, model messages and candidate attempt, allowlisted problem metadata,
+scalar verdict, model usage/cost/timing, and non-grading live sandbox provenance.
+They carry no added structured test inputs, expected outputs, candidate execution
+output, receipt key, or grading sandbox events. Embedded examples are already in
+the official prompt; the candidate attempt is model-generated, not a dataset
+reference solution or a structured test answer key.
 
 Package code is Apache-2.0; adapted upstream portions retain their MIT notice.
 **Dataset licensing is ambiguous upstream**: the card says `cc` without a variant,

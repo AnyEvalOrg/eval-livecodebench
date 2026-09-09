@@ -48,8 +48,7 @@ def test_inputs_derive_only_from_statement_and_starter():
         if record_to_sample(tainted).input != sample.input:
             pytest.fail("Metadata changed the model input")
         assert "METADATA_SECRET_SENTINEL" not in record_to_sample(tainted).input
-        assert sample.metadata["private_test_cases"] == record["private_test_cases"]
-        assert sample.metadata["public_test_cases"] == record["public_test_cases"]
+        assert set(sample.metadata) <= {"question_id", "question_title", "platform", "contest_date", "difficulty"}
 
 
 def test_all_packaged_tests_decode_and_have_consistent_kinds():

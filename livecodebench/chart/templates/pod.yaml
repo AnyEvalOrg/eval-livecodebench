@@ -3,6 +3,7 @@ apiVersion: v1
 kind: Pod
 metadata:
   name: {{ .Release.Name }}-default
+  namespace: {{ .Release.Namespace }}
   labels:
     app.kubernetes.io/name: {{ .Chart.Name }}
     app.kubernetes.io/instance: {{ .Release.Name }}

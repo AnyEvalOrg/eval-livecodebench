@@ -46,7 +46,7 @@
     {
       "type": "container",
       "source": "coredns/coredns:1.8.3",
-      "condition": "Built-in k8s chart only; omitted by anyeval_chart=true"
+      "condition": "Explicit anyeval_chart=false exception only; absent from default chart"
     }
   ],
   "scaffolds": [

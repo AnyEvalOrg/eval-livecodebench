@@ -1,4 +1,4 @@
-# inspect-k8s-sandbox==0.13.0 built-in chart values; also consumed by chart/.
+# AnyEval chart default values; provider chart is an explicit exception.
 # AnyEval: set INSPECT_K8S_DEFAULT_NAMESPACE=anyeval-sandbox.
 global:
   nameOverride: ""
@@ -41,10 +41,9 @@ additionalResources:
     kind: NetworkPolicy
     metadata:
       name: '{{ .Release.Name }}-livecodebench-deny-all'
+      namespace: '{{ .Release.Namespace }}'
     spec:
-      podSelector:
-        matchLabels:
-          app.kubernetes.io/instance: '{{ .Release.Name }}'
+      podSelector: {}
       policyTypes: [Ingress, Egress]
       ingress: []
       egress: []

@@ -66,7 +66,7 @@ def main() -> int:
     from livecodebench import livecodebench
 
     logs = inspect_eval(
-        livecodebench(sandbox_type=args.sandbox_type, anyeval_chart=args.sandbox_type == "k8s"),
+        livecodebench(sandbox_type=args.sandbox_type),
         model=args.model,
         sample_id=args.sample_id,
         epochs=1,

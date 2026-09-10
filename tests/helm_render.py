@@ -15,37 +15,48 @@ def render_chart(chart, values, release, namespace):
         '.Values': values,
         '.Release': {'Name': release, 'Namespace': namespace},
         '.Chart': yaml.safe_load((chart / 'Chart.yaml').read_text()),
-        '$service': values['services']['default'],
     }
     context['.Chart']['Name'] = context['.Chart']['name']
-
-    def lookup(expression):
-        for prefix, value in context.items():
-            if expression == prefix or expression.startswith(prefix + '.'):
-                for key in expression[len(prefix):].strip('.').split('.'):
-                    if key:
-                        value = value[key]
-                return value
-        raise AssertionError(f'Unsupported template expression: {expression}')
 
     def to_yaml(value):
         return yaml.safe_dump(value, sort_keys=False).removesuffix('...\n').rstrip()
 
     def render(source):
+        # Declarations belong to this template and take effect in source order.
+        variables = {}
+
+        def lookup(expression):
+            path = re.fullmatch(r'(\.[A-Za-z_]\w*|\$[A-Za-z_]\w*)((?:\.[A-Za-z_]\w*)*)', expression)
+            if not path:
+                raise AssertionError(f'Unsupported template expression: {expression}')
+            root, tail = path.groups()
+            scope = variables if root.startswith('$') else context
+            if root not in scope:
+                raise AssertionError(f'Undeclared variable or unknown path: {expression}')
+            value = scope[root]
+            for key in tail.split('.')[1:]:
+                if not isinstance(value, dict) or key not in value:
+                    raise AssertionError(f'Unknown template path: {expression}')
+                value = value[key]
+            return value
+
         # Helm's left/right whitespace trimming, before expression substitution.
         source = re.sub(r'\s*{{-', '{{', source)
         source = re.sub(r'-}}\s*', '}}', source)
-        source = source.replace('{{ $service := .Values.services.default }}', '')
-        source = re.sub(
-            r'{{ range \.Values.additionalResources }}(.*?){{ end }}',
-            lambda match: ''.join(
-                render(match[1].replace('{{ tpl (toYaml .) $ }}', to_yaml(resource)))
-                for resource in values['additionalResources']
-            ), source, flags=re.S,
-        )
+        # Only the resource loop used by network-policy.yaml is supported.
+        # Match its entire body, so even an empty range cannot hide bad syntax.
+        resource_loop = r'{{\s*range \.Values.additionalResources\s*}}\n{{\s*tpl \(toYaml \.\) \$\s*}}\n---{{\s*end\s*}}'
 
         def substitute(match):
+            if re.fullmatch(resource_loop, match[0]):
+                resources = lookup('.Values.additionalResources')
+                assert isinstance(resources, list), 'Expected additionalResources list'
+                return ''.join('\n' + render(to_yaml(resource)) + '\n---' for resource in resources)
             expression = match[1].strip()
+            declaration = re.fullmatch(r'(\$[A-Za-z_]\w*)\s*:=\s*(\S+)', expression)
+            if declaration:
+                variables[declaration[1]] = lookup(declaration[2])
+                return ''
             if expression == 'toYaml (.Values.annotations | default dict) | nindent 4':
                 value = to_yaml(values.get('annotations') or {})
                 return '\n' + '\n'.join('    ' + line for line in value.splitlines())
@@ -58,7 +69,7 @@ def render_chart(chart, values, release, namespace):
             value = lookup(expression)
             return str(value).lower() if isinstance(value, bool) else str(value)
 
-        rendered = re.sub(r'{{(.*?)}}', substitute, source, flags=re.S)
+        rendered = re.sub(resource_loop + r'|{{(.*?)}}', substitute, source, flags=re.S)
         assert '{{' not in rendered and '}}' not in rendered
         return rendered
 

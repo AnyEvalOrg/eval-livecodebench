@@ -102,18 +102,19 @@ def test_render_default_chart_matches_anyeval_pod_contract():
         bundled = Path(__file__).resolve().parents[1] / ".build/helm"
         helm = str(bundled) if bundled.is_file() else None
     config = livecodebench().sandbox.config
+    from helm_render import render_chart
+    rendered = render_chart(
+        Path(config.chart), yaml.safe_load(config.values.read_text()),
+        "lcb-fixture", "anyeval-sandbox",
+    )
+    resources = [r for r in yaml.safe_load_all(rendered) if r]
     if helm:
-        rendered = subprocess.run([
+        helm_rendered = subprocess.run([
             helm, "template", "lcb-fixture", config.chart, "--namespace", "anyeval-sandbox",
             "--values", str(config.values),
         ], check=True, capture_output=True, text=True).stdout
-    else:
-        from helm_render import render_chart
-        rendered = render_chart(
-            Path(config.chart), yaml.safe_load(config.values.read_text()),
-            "lcb-fixture", "anyeval-sandbox",
-        )
-    resources = [r for r in yaml.safe_load_all(rendered) if r]
+        helm_resources = [r for r in yaml.safe_load_all(helm_rendered) if r]
+        assert sorted(resources, key=lambda r: r['kind']) == sorted(helm_resources, key=lambda r: r['kind'])
     assert len(resources) == 2
     assert sum(r["kind"] == "Pod" for r in resources) == 1
     assert sum(r["kind"] == "NetworkPolicy" for r in resources) == 1

@@ -225,6 +225,16 @@ custom sandbox image digest per run.
 
 ## Build, test and publication
 
+The test suite requires **Helm 3.19.0 on PATH** and fails if it is missing or a
+different version. Download the archive for your OS/architecture from the
+[official Helm v3.19.0 release](https://github.com/helm/helm/releases/tag/v3.19.0),
+compare its SHA-256 (`shasum -a 256 <archive>` on macOS or `sha256sum <archive>` on
+Linux) with the matching checksum linked on that release page before extracting,
+then place the extracted `helm` executable in a directory on PATH; verify with
+`helm version --short`. Chart tests run real `helm template` and `helm lint --strict`
+locally, including invalid-template regressions; no cluster or network is needed
+once Helm is installed, and there is no fallback renderer or missing-Helm skip.
+
 ```bash
 python scripts/build_dataset.py           # pinned fetch, only during maintenance
 python scripts/build_dataset.py --offline # reuse ignored .build/latest.jsonl.gz

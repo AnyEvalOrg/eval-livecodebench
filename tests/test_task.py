@@ -1,5 +1,7 @@
 from importlib.resources import files
 from pathlib import Path
+import shutil
+import subprocess
 
 import pytest
 import yaml
@@ -93,28 +95,56 @@ def test_builtin_chart_is_explicit_exception():
     assert Path(task.sandbox.config).name == "values.yaml"
 
 
-def test_render_default_chart_matches_anyeval_pod_contract():
-    import os
-    import shutil
-    import subprocess
-    helm = os.environ.get("HELM") or shutil.which("helm")
-    if not helm:
-        bundled = Path(__file__).resolve().parents[1] / ".build/helm"
-        helm = str(bundled) if bundled.is_file() else None
-    config = livecodebench().sandbox.config
-    from helm_render import render_chart
-    rendered = render_chart(
-        Path(config.chart), yaml.safe_load(config.values.read_text()),
-        "lcb-fixture", "anyeval-sandbox",
+HELM_INSTALL = (
+    "Install pinned Helm 3.19.0 from https://github.com/helm/helm/releases/tag/v3.19.0: "
+    "download the official archive for your OS/architecture, verify its SHA-256 "
+    "against the release checksum, extract it, and put helm on PATH. "
+    "See README.md, Build, test and publication."
+)
+
+
+def require_helm():
+    helm = shutil.which("helm")
+    if helm is None:
+        pytest.fail("helm is required on PATH. " + HELM_INSTALL, pytrace=False)
+    return helm
+
+
+@pytest.fixture(scope="module")
+def helm():
+    executable = require_helm()
+    version = subprocess.run(
+        [executable, "version", "--template", "{{ .Version }}"],
+        capture_output=True, text=True, timeout=30,
     )
+    assert version.returncode == 0, version.stdout + version.stderr
+    assert version.stdout.strip() == "v3.19.0", HELM_INSTALL
+    return executable
+
+
+def test_missing_helm_fails_with_install_instructions(monkeypatch, tmp_path):
+    monkeypatch.setenv("PATH", str(tmp_path))
+    with pytest.raises(pytest.fail.Exception, match="helm is required on PATH") as error:
+        require_helm()
+    assert HELM_INSTALL in str(error.value)
+
+
+def test_render_default_chart_matches_anyeval_pod_contract(helm):
+    config = livecodebench().sandbox.config
+    lint = subprocess.run(
+        [helm, "lint", "--strict", str(config.chart), "-n", "anyeval-sandbox",
+         "-f", str(config.values)],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert lint.returncode == 0, lint.stdout + lint.stderr
+    result = subprocess.run(
+        [helm, "template", "lcb-fixture", str(config.chart), "-n", "anyeval-sandbox",
+         "-f", str(config.values)],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    rendered = result.stdout
     resources = [r for r in yaml.safe_load_all(rendered) if r]
-    if helm:
-        helm_rendered = subprocess.run([
-            helm, "template", "lcb-fixture", config.chart, "--namespace", "anyeval-sandbox",
-            "--values", str(config.values),
-        ], check=True, capture_output=True, text=True).stdout
-        helm_resources = [r for r in yaml.safe_load_all(helm_rendered) if r]
-        assert sorted(resources, key=lambda r: r['kind']) == sorted(helm_resources, key=lambda r: r['kind'])
     assert len(resources) == 2
     assert sum(r["kind"] == "Pod" for r in resources) == 1
     assert sum(r["kind"] == "NetworkPolicy" for r in resources) == 1
@@ -122,6 +152,8 @@ def test_render_default_chart_matches_anyeval_pod_contract():
     pod = next(r for r in resources if r and r["kind"] == "Pod")
     spec = pod["spec"]
     assert pod["metadata"]["namespace"] == "anyeval-sandbox"
+    assert pod["metadata"]["name"] == "lcb-fixture-default"
+    assert pod["metadata"]["labels"]["inspect/service"] == "default"
     assert spec["runtimeClassName"] == "gvisor"
     assert spec["nodeSelector"] == {"cloud.google.com/gke-spot": "true"}
     assert spec["automountServiceAccountToken"] is False
@@ -143,6 +175,8 @@ def test_render_default_chart_matches_anyeval_pod_contract():
         "cpu": "1", "memory": "1Gi", "ephemeral-storage": "1Gi",
     }
     security = spec["containers"][0]["securityContext"]
+    values = yaml.safe_load(config.values.read_text())
+    assert security == values["services"]["default"]["securityContext"]
     assert security["runAsUser"] == security["runAsGroup"] == 0
     assert set(security["capabilities"]["add"]) == {"SETUID", "SETGID", "KILL", "CHOWN", "DAC_OVERRIDE"}
     assert not security.get("privileged", False)
@@ -152,11 +186,40 @@ def test_render_default_chart_matches_anyeval_pod_contract():
     assert security["capabilities"]["drop"] == ["ALL"]
     policy = next(r for r in resources if r and r["kind"] == "NetworkPolicy")
     assert policy["metadata"]["namespace"] == "anyeval-sandbox"
+    assert policy["metadata"]["name"] == "lcb-fixture-livecodebench-deny-all"
     assert policy["spec"]["egress"] == []
     assert policy["spec"]["ingress"] == []
     assert set(policy["spec"]["policyTypes"]) == {"Ingress", "Egress"}
     assert policy["spec"]["podSelector"] == {}
-    assert "Cilium" not in rendered and "coredns" not in rendered
+    assert "cilium" not in rendered.lower() and "coredns" not in rendered.lower()
+    for template in Path(config.chart).joinpath("templates").rglob("*"):
+        if template.is_file():
+            source = template.read_text().lower()
+            assert "cilium" not in source, template
+            assert "statefulset" not in source, template
+
+
+@pytest.mark.parametrize("original, replacement, diagnostic", [
+    ('{{- $service := .Values.services.default }}', '', 'undefined variable "$service"'),
+    ('{{- toYaml', '{{-toYaml', 'parse error'),
+    ('.Values.services.default', '.Values.missing.default', 'nil pointer evaluating'),
+], ids=["undeclared-service", "invalid-trim-marker", "unknown-values-path"])
+def test_helm_rejects_invalid_chart_templates(helm, tmp_path, original, replacement, diagnostic):
+    config = livecodebench().sandbox.config
+    chart = tmp_path / "chart"
+    shutil.copytree(config.chart, chart)
+    template = chart / "templates/pod.yaml"
+    source = template.read_text()
+    assert original in source  # Ensure the mutation actually changes this chart.
+    template.write_text(source.replace(original, replacement, 1))
+    result = subprocess.run(
+        [helm, "template", "lcb-fixture", str(chart), "-n", "anyeval-sandbox",
+         "-f", str(config.values)],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode != 0, "Helm accepted an invalid template"
+    assert "templates/pod.yaml" in result.stderr
+    assert diagnostic in result.stderr
 
 
 def test_default_namespace_is_anyeval_sandbox(monkeypatch):

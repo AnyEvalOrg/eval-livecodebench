@@ -10,12 +10,13 @@ allowEntities: []
 allowCIDR: []
 services:
   default:
-    image: eval-livecodebench-sandbox:local
+    # Cloud Build tag matches pyproject.toml; AnyEval pins the digest in its catalog.
+    image: us-central1-docker.pkg.dev/openevalz-sbx-84737/openevalz/eval-livecodebench-sandbox:1.0.0
     command: ["sleep", "infinity"]
     workingDir: /tmp
     runtimeClassName: gvisor
     nodeSelector:
-      anyeval.io/tier: sandbox
+      cloud.google.com/gke-spot: "true"
     networkIsolated: true
     securityContext:
       runAsUser: 0
@@ -31,12 +32,15 @@ services:
       requests:
         cpu: "1"
         memory: 1Gi
+        # Disk-backed /tmp/lcb-* requests, candidate files and captured streams.
+        ephemeral-storage: 1Gi
       limits:
         cpu: "1"
         memory: 1Gi
+        ephemeral-storage: 1Gi
 # Standard NetworkPolicy is visible to AnyEval's provenance hook (which queries
-# networking.k8s.io, not Cilium CRDs). Cilium's networkIsolated deny also blocks its
-# default DNS allowances; the custom AnyEval chart emits only this standard policy.
+# networking.k8s.io). The Autopilot cluster has no CiliumNetworkPolicy CRD;
+# the custom AnyEval chart emits only this standard policy, including DNS denial.
 additionalResources:
   - apiVersion: networking.k8s.io/v1
     kind: NetworkPolicy

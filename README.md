@@ -137,7 +137,8 @@ inspect eval livecodebench/livecodebench \
 
 Docker must be available. Compose builds the packaged `livecodebench/Dockerfile`
 as `eval-livecodebench-sandbox:local` from `python:3.12-slim`, installing `procps`
-for `/usr/bin/pkill` and reserving UID/GID 65532 as `lcb-candidate`. Image building
+for `/usr/bin/pkill`, `util-linux` for `dmesg`, and `hostname` for provenance,
+and reserving UID/GID 65532 as `lcb-candidate`. Image building
 requires network access; the running container uses `network_mode: none`.
 The image must provide `/usr/local/bin/python3`, GNU `timeout`, procps `pkill`, and
 a root-owned interpreter/system tree that UID 65532 cannot modify. Numeric IDs are
@@ -153,27 +154,45 @@ of these capabilities. Container memory and process limits remain in force.
 The distribution is `eval-livecodebench`, the module is `livecodebench`, and the
 `inspect_ai` entry point imports that module for cold task discovery. Python >=3.11
 is supported. The `[inspect]` extra pins `inspect_ai==0.3.260`; `[anyeval]` also pins
-`inspect-evals==0.18.0` and `inspect-k8s-sandbox==0.13.0`. These are AnyEval's resolved
+`inspect-evals==0.19.0` and `inspect-k8s-sandbox==0.13.0`. These are AnyEval's resolved
 installed versions; its requirements specify ranges for the first two. This task
 does not depend on, import, or wrap `inspect_evals`' LiveCodeBench-Pro implementation.
 
 ## Kubernetes and AnyEval
 
-The default Kubernetes configuration uses the packaged AnyEval chart and values.
-It creates one Python Pod and a standard namespace-wide deny-all NetworkPolicy,
-with no Cilium resources or DNS sidecar. It requests the built `eval-livecodebench-sandbox:local` image,
-`runtimeClassName: gvisor`, node selector `anyeval.io/tier: sandbox`, no service-account
-token and `restartPolicy: Never`. The UID separation required here replaces the
-previous all-nonroot configuration: trusted execs require UID 0 and the five
-capabilities above, while candidates run as UID 65532. A cluster policy requiring
-`runAsNonRoot: true` for the entire container must allow this explicit exception;
-that setting cannot enforce this supervisor/candidate split. The values follow
-the **0.13.0** provider schema.
+The default Kubernetes configuration targets the GKE Autopilot cluster
+`anyeval-sandbox` and namespace `anyeval-sandbox`, using the packaged Pod-based
+AnyEval chart and **0.13.0** provider values schema. It creates one Python Pod and
+one native, namespace-wide deny-all NetworkPolicy with empty ingress and egress
+(including DNS). The cluster has no `CiliumNetworkPolicy` kind.
 
-Before Kubernetes evaluation, build `livecodebench/Dockerfile`, push the resulting
-image to a registry accessible to the sandbox nodes, and set `services.default.image`
-in the packaged `values.yaml` to that registry reference (prefer a pinned digest).
-The `:local` default works only when that image is preloaded on the nodes.
+The Pod uses `runtimeClassName: gvisor` (handler `gvisor`) and the sole node selector
+`cloud.google.com/gke-spot: "true"`. Autopilot Spot nodes scale from zero, so initial
+scheduling can wait for provisioning. Custom node labels are not accepted. The Pod
+template deliberately omits tolerations: Autopilot injects the Spot toleration.
+It disables service-account token mounting and uses `restartPolicy: Never`.
+
+Requests equal limits: **1 CPU, 1 GiB memory, and 1 GiB ephemeral storage**. This
+meets the 250m CPU minimum and the permitted 1:1–1:6.5 CPU-to-memory ratio; Autopilot
+would overwrite unequal limits. The disk allocation gives headroom for sequential
+`/tmp/lcb-*` request/input files, candidate scratch files and the two captured
+streams (each capped at 1 MiB). Normal completion removes each test directory;
+ephemeral storage also accounts for the writable container layer and logs. This
+is a scheduling/eviction budget, not a per-file quota. There are no hostPath mounts,
+privileged containers or host networking.
+
+Trusted execs run as UID/GID 0, permitted for these gVisor Pods, retaining only
+`SETUID`, `SETGID`, `KILL`, `CHOWN` and `DAC_OVERRIDE` from Autopilot's default allowed
+set. Privilege escalation is disabled and seccomp uses `RuntimeDefault`. Candidates
+irreversibly drop to UID/GID 65532 with no capabilities.
+
+Cloud Build builds `livecodebench/Dockerfile` and publishes the worker's sandbox
+image as
+`us-central1-docker.pkg.dev/openevalz-sbx-84737/openevalz/eval-livecodebench-sandbox:1.0.0`.
+The tag in `values.yaml` matches the package version in `pyproject.toml`; update both
+when releasing. **AnyEval pins the image by digest in its catalog**, using the
+resolved Artifact Registry digest. Publish the image before evaluating; the worker
+must be able to pull it from that registry.
 
 ```bash
 python -m pip install '.[anyeval]'
@@ -182,18 +201,39 @@ inspect eval livecodebench/livecodebench --model <provider/model>
 
 The task defaults `INSPECT_K8S_DEFAULT_NAMESPACE` to `anyeval-sandbox` when unset;
 the provider exposes namespace selection only through that setting. An explicit
-namespace setting is retained. The cluster must provide the namespace, gVisor
-runtime, sandbox node pool and enforcing network-policy implementation. AnyEval's
+namespace setting is retained. The verified cluster provides the namespace and
+gVisor RuntimeClass; Autopilot
+provisions Spot nodes and enforces the native network policy. AnyEval's
 existing namespace-wide `deny-all-egress` policy remains in force as well.
 
 `-T anyeval_chart=false` explicitly selects the provider's built-in Cilium chart
 for other clusters. It requires Cilium CRDs and includes a CoreDNS sidecar; it is
 not the AnyEval deployment path. Docker selection needs only `-T sandbox_type=docker`.
 
-The provenance hook must still verify the **live** kernel, resolved image digests,
-node and selecting policies; values alone do not prove containment. Record the resolved custom sandbox image digest per run.
+The provenance hook runs `uname -r`, `dmesg` and `hostname` **inside the sandbox
+container** as its configured user (root). It requires the boot line
+`[    0.000000] Starting gVisor...` from `dmesg`. The Dockerfile explicitly installs
+`util-linux` and `hostname` and checks their executables during the build. With no
+local Docker available, executable locations were verified against Debian's
+[util-linux file list](https://packages.debian.org/trixie/amd64/util-linux/filelist)
+and [hostname file list](https://packages.debian.org/trixie/amd64/hostname/filelist);
+reading the live gVisor boot log still requires a cluster run.
+
+The hook must also verify the **live** kernel, resolved image digests, node and
+selecting policies; values alone do not prove containment. Record the resolved
+custom sandbox image digest per run.
 
 ## Build, test and publication
+
+The test suite requires **Helm 3.19.0 on PATH** and fails if it is missing or a
+different version. Download the archive for your OS/architecture from the
+[official Helm v3.19.0 release](https://github.com/helm/helm/releases/tag/v3.19.0),
+compare its SHA-256 (`shasum -a 256 <archive>` on macOS or `sha256sum <archive>` on
+Linux) with the matching checksum linked on that release page before extracting,
+then place the extracted `helm` executable in a directory on PATH; verify with
+`helm version --short`. Chart tests run real `helm template` and `helm lint --strict`
+locally, including invalid-template regressions; no cluster or network is needed
+once Helm is installed, and there is no fallback renderer or missing-Helm skip.
 
 ```bash
 python scripts/build_dataset.py           # pinned fetch, only during maintenance

@@ -14,7 +14,7 @@ dependencies = []
 [project.optional-dependencies]
 # AnyEval requirements give ranges; these are its installed, resolved versions.
 inspect = ["inspect_ai==0.3.260"]
-anyeval = ["inspect_ai==0.3.260", "inspect-evals==0.18.0", "inspect-k8s-sandbox==0.13.0"]
+anyeval = ["inspect_ai==0.3.260", "inspect-evals==0.19.0", "inspect-k8s-sandbox==0.13.0"]
 test = ["inspect_ai==0.3.260", "pytest>=8", "PyYAML>=6", "jsonschema>=4"]
 
 # Inspect discovers this import before resolving livecodebench/livecodebench.

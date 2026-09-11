@@ -190,7 +190,12 @@ def test_render_default_chart_matches_anyeval_pod_contract(helm):
     assert policy["spec"]["egress"] == []
     assert policy["spec"]["ingress"] == []
     assert set(policy["spec"]["policyTypes"]) == {"Ingress", "Egress"}
-    assert policy["spec"]["podSelector"] == {}
+    # The policy must select THIS release's pod and nothing else: `podSelector: {}` selects
+    # every pod in the namespace (it starved the shared egress proxy on 2026-09-11), and the
+    # instance label is what the Pod template stamps on the release's own pod.
+    pod = next(r for r in resources if r and r["kind"] == "Pod")
+    assert policy["spec"]["podSelector"] == {"matchLabels": {"app.kubernetes.io/instance": "lcb-fixture"}}
+    assert pod["metadata"]["labels"]["app.kubernetes.io/instance"] == "lcb-fixture"
     assert "cilium" not in rendered.lower() and "coredns" not in rendered.lower()
     for template in Path(config.chart).joinpath("templates").rglob("*"):
         if template.is_file():

@@ -48,7 +48,11 @@ additionalResources:
       name: '{{ .Release.Name }}-livecodebench-deny-all'
       namespace: '{{ .Release.Namespace }}'
     spec:
-      podSelector: {}
+      # Select THIS release's pod only. `podSelector: {}` selects every pod in the namespace,
+      # including shared infrastructure such as the egress proxy, and starved it of egress.
+      podSelector:
+        matchLabels:
+          app.kubernetes.io/instance: '{{ .Release.Name }}'
       policyTypes: [Ingress, Egress]
       ingress: []
       egress: []
